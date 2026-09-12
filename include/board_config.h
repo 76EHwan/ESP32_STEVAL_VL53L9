@@ -21,8 +21,10 @@
 #define PIN_SDA        21
 #define PIN_SCL        22
 
-// 브링업 단계에서는 느리게 시작한다. 안정 확인 후 400k 로 올릴 것.
-#define I2C_FREQ_HZ    100000UL
+// 100k 로 64KB 전 구간 읽기 실패 0 을 확인했으므로 400k 로 올린다.
+// 프레임을 레지스터 공간에서 읽어오므로 속도가 곧 프레임레이트다.
+// binning 2(54x42, 14842B) 기준 400k 에서 프레임당 약 0.33초.
+#define I2C_FREQ_HZ    400000UL
 
 // --- I2C 주소 (회로도에 명시된 값) ---
 #define TOF_I2C_ADDR_7BIT     0x29   // VL53L9CX     (8-bit 0x52)

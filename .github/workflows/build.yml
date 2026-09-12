@@ -1,0 +1,44 @@
+# ---------------------------------------------------------------------------
+# PR 마다 펌웨어가 컴파일되는지 확인한다.
+#
+# 이 저장소는 HW 를 가진 사람과 코드를 보내는 사람이 다르다. 빌드조차 안 되는
+# PR 을 받으면 플래시해보고 나서야 알게 되므로, 컴파일 검증만이라도 자동으로
+# 돌려서 리뷰 전에 걸러낸다.
+#
+# ubuntu 에서 돌린다. Windows 러너는 툴체인 경로가 MAX_PATH(260자) 에 걸려
+# xtensa-esp32-elf-g++ 가 "CreateProcess: No such file or directory" 로 죽는
+# 경우가 있다.
+# ---------------------------------------------------------------------------
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # 툴체인(약 1.6GB)을 매번 받으면 느리다. platformio.ini 가 바뀔 때만 갱신.
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/.cache
+            ~/.cache/pip
+          key: pio-${{ hashFiles('platformio.ini') }}
+          restore-keys: pio-
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Build
+        run: pio run
