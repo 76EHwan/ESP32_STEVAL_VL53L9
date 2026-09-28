@@ -1,194 +1,144 @@
 # ST 커뮤니티 문의 초안
 
-https://community.st.com/ → Imaging (sensors) 게시판에 그대로 붙여넣으면 된다.
-제목과 본문은 영어로 준비했다.
+https://community.st.com/ → **Imaging (sensors)** 게시판. 아래 `---` 사이의 제목과
+본문(영어)을 그대로 붙여넣으면 된다. 코드 블록은 게시판 편집기의 "Insert code"
+로 넣으면 정렬이 유지된다.
 
 ---
 
-**Title:** VL53L9CX: FW_ERROR (ERROR_CODE 0x0F00) immediately on first frame trigger, STEVAL-VL53L9 over I2C
+**Title:** VL53L9CX on STEVAL-VL53L9: firmware faults on the first frame (ERROR_CODE 0x0F00, REF_ARRAY_ERROR, ref_amplitude = 0) — reproduced with 2 sensors and 3 independent host implementations
 
 ---
 
-I am running the VL53L9CX on a STEVAL-VL53L9 board with a non-ST host (ESP32,
-plain I2C at 400 kHz, 7-bit address 0x29). I ported the `drivers/vl53l9`
-sources from STSW-IMG053 and implemented the `vl53l9_platform.h` functions.
+## Summary
 
-Everything works up to and including `vl53l9_start()`. The device reaches
-STREAMING with no error bits. But the moment ranging actually starts, the
-firmware faults and the device drops back to STANDBY.
+On my STEVAL-VL53L9, the VL53L9CX boots, installs FW patch 0.17, reaches
+STREAMING with all error bits clear — and then faults on the very first frame.
+The reference SPAD array reports **zero amplitude on every channel**, as if the
+VCSELs never fire.
 
-## What works
+I have reproduced this with **two different VL53L9CX parts** and **three
+independent host implementations**, each of which is known to work on another
+STEVAL-VL53L9. I have run out of things I can change from software, and I would
+like to understand what the firmware error codes mean.
 
-```
-vl53l9_init()            OK   (FW patch 9865 B installed, version check passes)
-vl53l9_get_device_id()   OK   0x53334C39
-vl53l9_get_calib_data()  OK   2332 B, 1839 non-zero
-vl53l9_set_power_mode / set_frame_period / set_context /
-  set_binning / set_exposure / set_sync_mode        all OK
-vl53l9_start()           OK   fsm = 0x03 (STREAMING), all error bits clear
-```
+## Setup
 
-Note `vl53l9_get_calib_data()` succeeds, which means
-`COMMAND_SWITCH_TO_FAST_CLOCK` works and the PLL comes up fine.
+- Board: STEVAL-VL53L9, VL53L9CX hand-soldered by me
+- Host: ESP32 (DevKit v1) through the J2 header, plain I2C at 400 kHz, address 0x29
+- Clock: on-board 12 MHz Y1 (R25 removed, R24 fitted, R23 removed); `EXT_CLOCK` = 12000000
+- J3 (Host IO) = 3.3 V; `VDDA_CFG` = 2.8 V, `VDDIO_CFG` = 1.8 V
+- XSHUT driven by the host, SYNC_IN tied high, INTR not used (FRAME_READY polled)
+- FW patch 0.17 (9,865 bytes, byte-identical to `vl53l9_patch.h` in STSW-IMG053 / 53L9A1 BSP)
 
-## The failure
+## Symptom
 
-Polling `vl53l9_get_status()` every 1 ms right after `vl53l9_trigger_frame()`:
-
-```
-trigger + 0 ms   fsm = 0x03 (STREAMING)   ERROR_STATUS = 0x80   ERROR_CODE = 0x0F00
-                 LDD_STATUS[0..4] = 00 00 14 00 00
-```
-
-Then the device transitions to STANDBY (fsm = 0x02) and every subsequent
-`vl53l9_trigger_frame()` returns `VL53L9_ERROR_INVALID_STATE`.
-
-`ERROR_STATUS = 0x80` is **only** `VL53L9_REGFIELD_FW_ERROR` (BIT 7).
-All of `I_LIMIT`, `VHV_UNDERVOLTAGE`, `VHV_OVERVOLTAGE`,
-`SPAD_SUPPLY_OVERLOAD`, `PLL_LOCK`, `REF_ARRAY` and
-`SOF_OUTSIDE_BLANKING` are clear. The fault occurs at +0 ms, before any
-meaningful VCSEL load, so this does not look like a supply/current issue.
-
-**My question: what does ERROR_CODE (0x0064) = 0x0F00 mean?** Is there a
-published list of firmware error codes? That is the only piece of information
-I am missing.
-
-## Configuration actually present in the device, read back before `vl53l9_start()`
+Default profile (54x42, SHORT context, ULTRA_LOW power, MANUAL sync, 10 ms exposure):
 
 ```
-0x04CC STREAM_STEP_NUMBER(SHORT) = 7
-0x0504 NB_SHOT_STEP(1..7, SHORT) = 100 / 200 / 400 / 615 / 1231 / 1231 / 100
-0x047A CONTEXT_SELECTION = 0x00 (SHORT)
-0x047C SYNCHRO           = 0x01 (MANUAL)
-0x0480 FRAME_PERIOD      = 33333
-0x0484 OUTPUT_IF         = 0x01 (I3C / serial)
-0x048C POWER_MODE        = 0x00 (REGULAR)
-0x04C4 STANDBY_BINNING   = 0x08
+power on / load patch / BOOT / version check 0.17    OK
+configure                                             OK
+START_STREAM          fsm = 0x03 STREAMING, ERROR_STATUS = 0x00
+
+TRIGGER_NEXT_FRAME    -> FRAME_READY never set
+                      fsm = 0x02 STANDBY
+                      ERROR_CODE   = 0x0F00
+                      ERROR_STATUS = 0x80  (FW_ERROR only)
+                      LDD_STATUS[0..4] = 00 00 14 00 00
+                      frame_counter = 0, temperature = 35, ldd_temperature = 0
+                      ref LONG/SHORT amplitude = 0 on both channels
+
+START_STREAM again (no XSHUT cycle) -> accepted, next frame faults with
+                      ERROR_CODE = 0x0008, ERROR_STATUS = 0x80, LDD_STATUS all 0
 ```
 
-## Root cause narrowed: the VCSELs do not emit
-
-Switching `output_interface` to CSI2 (purely as a bisect - the host has no CSI
-receiver, I only read `FRAME_COUNTER` and the error bits) gets much further and
-exposes a different error:
+With CSI-2 output and the ESP32-P4 project's profile (binning 2, AUTONOMOUS,
+10 ms period, 4 ms exposure, DSS off), the fault happens within 100 ms of
+`START_STREAM`, and this time the reference-array check is reported explicitly:
 
 ```
-trigger_frame -> OK
-FRAME_COUNTER 0 -> 1                     <- a frame IS acquired
-fsm = 0x02 (STANDBY)   ERROR_CODE = 0x0903
-ERROR_STATUS = 0xC0  ->  FW_ERROR | REF_ARRAY_ERROR
+fsm = 0x02 STANDBY   ERROR_CODE = 0x0F00   ERROR_STATUS = 0xC0 (FW_ERROR | REF_ARRAY_ERROR)
+LDD_STATUS[0..4] = 00 00 14 00 00   frame_counter = 1
+ref_amplitude = 0 on all channels
 ```
 
-Reading the 100-byte status line at `VL53L9_REGBASE_SENSOR_STATUS` (0x0028),
-which the frame metadata struct overlays directly:
+`I_LIMIT`, `VHV_UNDERVOLTAGE`, `VHV_OVERVOLTAGE`, `SPAD_SUPPLY_OVERLOAD`,
+`PLL_LOCK` and `SOF_OUTSIDE_BLANKING` are **never** set.
 
-```
-frame_counter = 1     temperature = 32     ldd_temperature = 0
-ref LONG   ch1 amp=0 dist=0     ch2 amp=0 dist=0
-ref SHORT  ch1 amp=0 dist=149   ch2 amp=0 dist=149
-frame 12x10   (matches the configured binning 8)
-LDD_STATUS[0..4] = 00 00 14 00 00
-```
+## What I have ruled out
 
-**`ref_amplitude` is 0 on both VCSEL channels in both contexts.** The reference
-SPAD array receives no light at all. `ldd_temperature` reads 0 while the die
-temperature reads a sane 32 C in the same frame.
+**Host software — three independent implementations, same result:**
 
-So the digital core, the configuration path and the ranging pipeline all work -
-the laser simply does not fire.
+1. A port of the ST core driver (`vl53l9.c`, core 1.0.0) with my own ESP32
+   platform layer.
+2. The same port configured to reproduce
+   [kamibukuro5656/VL53L9CX_ESP32-P4_USB_ROS2](https://github.com/kamibukuro5656/VL53L9CX_ESP32-P4_USB_ROS2)
+   exactly (works on a STEVAL-VL53L9 over MIPI CSI-2): same call order, same
+   profile, same CSI-2 settings.
+3. A from-scratch C++ port of
+   [VanBruce/vl53l9cx-python](https://github.com/VanBruce/vl53l9cx-python)
+   (works on a STEVAL-VL53L9 + Raspberry Pi 5 over plain I2C): same boot
+   timing, same default profile, same frame-read procedure.
 
-## Hardware checked
+All three follow the I2C rules I know of: index write and data read as separate
+transactions with a STOP in between (no repeated START), no address-only probe
+transactions. A 4 KB write/read-back to 0x1800 matches exactly, the model ID
+reads 0x53334C39, and the patch version check passes.
 
-- `VBAT_LDD` / `VBAT_RX` rail (P3V3) measured at C6/C7: **3.3 V, good**
-- AVDD 2.8 V, DVDD 1.2 V, IOVDD 1.8 V: all good
-- PLL: `vl53l9_get_calib_data()` succeeds, so `COMMAND_SWITCH_TO_FAST_CLOCK`
-  works
-- On-chip calibration: 2332 bytes read, 1839 non-zero
-- On-board 12 MHz oscillator in use (R25 removed, R24 fitted)
+**The sensor:** I replaced the VL53L9CX with a second, previously unused part.
+The calibration data returned by `vl53l9_get_calib_data()` differs between the
+two (1839 vs 1806 non-zero bytes), so they are genuinely different dies. Both
+fail the same way.
 
-One observation I cannot interpret: `CAL_TARGET_LD` (0x049C) reads
-**0x0000**, while the adjacent `CAL_RTN_OFFSET` (0x0497) is 0x20. The driver
-never writes `CAL_TARGET_LD`, so I assume it is loaded from OTP at boot. Is 0 a
-valid value here, or does it indicate the laser drive target failed to load?
+**The board:**
 
-**Questions:**
+- R23 / R24 / R25 visually checked: removed / fitted / removed
+- J3 on 3.3 V, SYNC_IN measured at 3.3 V
+- P3V3 (VBAT_LDD / VBAT_RX supply) measured at C6/C7: 3.3 V, and it stays at
+  3.3 V at the moment the frame is triggered
+- AVDD 2.8 V, IOVDD 1.8 V, DVDD 1.2 V all good
+- Clock: `COMMAND_SWITCH_TO_FAST_CLOCK` succeeds and a 2332-byte burst read
+  works on the PLL clock; I also re-soldered the oscillator — no change
+- No brownout or reset on either side at any point
 
-1. What does `ERROR_CODE` 0x0903 (and 0x0F00 in I3C output mode) mean?
-2. Is `CAL_TARGET_LD` = 0 expected?
-3. `ref_amplitude` = 0 on both channels with all supplies good - does this
-   indicate a failed part, or is there a configuration step that enables the
-   laser driver that I am missing?
+**Configuration variations that did not change the outcome:** SHORT / LONG
+context; binning 2 / 8 / 12; exposure 1 / 4 / 10 ms; REGULAR / ULTRA_LOW power;
+MANUAL / AUTONOMOUS sync; I3C / CSI-2 output; DSS on / off.
 
-Note: this board has had its EEPROM (U4) desoldered, so heat damage to the
-module cannot be excluded.
+## Questions
 
-## What I already ruled out
+1. **What do `ERROR_CODE` 0x0F00, 0x0903 and 0x0008 mean?** (0x0903 appears
+   with CSI-2 output and binning 12; 0x0008 after restarting the stream without
+   an XSHUT cycle.) This is the one piece of information I cannot get anywhere
+   else.
+2. **What does `LDD_STATUS[2]` = 0x14 indicate?** It is set whenever the
+   firmware gets as far as configuring the laser driver.
+3. **What would an open `VBAT_LDD` (B1) joint look like?** I hand-soldered both
+   parts and cannot inspect the LGA joints. Would an open B1 produce exactly
+   this signature (FW_ERROR / REF_ARRAY_ERROR, no I_LIMIT or VHV bits,
+   `ref_amplitude` = 0, `ldd_temperature` = 0), or would the laser driver
+   report it differently?
+4. **Is `CAL_TARGET_LD` (0x049C) = 0x0000 expected** after boot? The driver
+   never writes it; I assume it comes from OTP.
+5. Is there any initialization step that enables the laser driver and is not
+   exposed through the public driver API?
 
-Changing any of these does not change the symptom:
+## Appendix: possible issues in the ST core driver (`vl53l9.c`, core 1.0.0)
 
-| Parameter | Values tried |
-|---|---|
-| context | SHORT, LONG |
-| binning | 2, 8 |
-| exposure | 1 ms, 10 ms |
-| power_mode | REGULAR, ULTRA_LOW |
-| sync mode | MANUAL, AUTONOMOUS |
-| poll interval | 0 ms, 2 ms |
-| `vl53l9_set_hw_config()` | called, not called |
+Found while porting. Separate from the question above, but may be worth a look.
 
-With `SYNC_AUTONOMOUS` the fault happens immediately after `vl53l9_start()`
-instead of on trigger, which is consistent: autonomous mode starts ranging
-right away. So this is not specific to the trigger path.
+1. `_init_default_config()` ends with `vl53l9_read32(..., CAB_DIST_SCALE, &data)`
+   right after setting `data = 0x01000800`; it should be `vl53l9_write32`. On my
+   device the register read back 0x00000000 before I changed it.
+2. `vl53l9_get_status()` reads the five LDD status bytes into
+   `status->laser_driver` (index 0) every time; it should be
+   `&status->laser_driver[i]`.
+3. Several enum locals (FSM state, sync mode, context, DSS mode) are filled with
+   `vl53l9_read8()`. This works with 1-byte enums (`-fshort-enums`, the ARM
+   EABI default) but leaves three bytes of stack garbage with 4-byte enums.
+4. `vl53l9_set_hw_config()` masks the status-line data type with `0x2F`; the
+   field is `GENMASK(5, 0)`, so bit 4 is dropped.
+5. `_wait_for_state()` and `_write_cmd()` report a timeout when the expected
+   state or command completion arrives on the last polling iteration.
 
-I also verified my platform layer: writing 4096 bytes across several chunk
-boundaries to 0x1800 and reading them back gives an exact match, so the
-firmware patch is not being corrupted by my chunked I2C transfers.
-
-## Board notes
-
-- On-board 12 MHz oscillator Y1 in use (R25 removed, R24 fitted),
-  `ext_clock` reported as 12000000
-- VDDA = 2V8, VDDIO = 1V8 per the schematic note
-- The EEPROM U4 has been physically removed from this board
-
-## Possible driver issues I found while porting
-
-These are separate from the question above, but may be worth checking:
-
-**1. `_init_default_config()` — `read32` where `write32` is intended**
-
-```c
-// set cab_dist_scale according to default context selection (short)
-data = 0x01000800; // short 256 - long 2048
-return vl53l9_read32(p_dev, VL53L9_REGADDR_CAB_DIST_SCALE, &data);
-```
-
-`data` is overwritten immediately, so CAB_DIST_SCALE is never written.
-I read back 0x00000000 from 0xD524 on my device.
-
-**2. `vl53l9_get_status()` — LDD status always written to index 0**
-
-```c
-for (uint16_t i = 0U; i < 5U; i++) {
-    ret = vl53l9_read8(p_dev, VL53L9_REGADDR_LDD_STATUS(i), (uint8_t *)status->laser_driver);
-}
-```
-
-Should be `&status->laser_driver[i]`.
-
-**3. Uninitialized enum locals read via `vl53l9_read8()`**
-
-Seven places, e.g.
-
-```c
-static _fsm_state_t _get_fsm_state(void *const p_dev) {
-    _fsm_state_t state;
-    (void)vl53l9_read8(p_dev, VL53L9_REGADDR_SYSTEM_FSM, (uint8_t *)&state);
-    return state;
-}
-```
-
-This works on ARM because the EABI defaults to `-fshort-enums` (1-byte enums),
-but on a toolchain with 4-byte enums only the low byte is written and the
-remaining three bytes are stack garbage, so the state comparison never
-matches. Zero-initializing the locals fixes it.
+Thanks in advance for any pointers.
