@@ -35,10 +35,24 @@ extern "C" {
 #define WIRE_BUF     256
 #define CHUNK_BYTES  (WIRE_BUF - 8)
 
-void vl53l9_esp32_bus_begin(void) {
-  Wire.begin(PIN_SDA, PIN_SCL, I2C_FREQ_HZ);
-  Wire.setBufferSize(WIRE_BUF);
+// 반환값을 반드시 확인할 것.
+//
+// setBufferSize() 는 begin() 이후에 불리면 버퍼를 재할당하는데, 할당에
+// 실패하면 조용히 0 을 리턴하고 bufferSize 가 기본값 128 로 남는다. 그
+// 상태에서 248 바이트 청크를 쓰면 Wire.write() 가 126 바이트에서 잘려
+// vl53l9_write() 가 -1 을 리턴한다. Wire 는 이때 에러 로그를 남기지
+// 않으므로 증상이 "슬레이브 NACK" 과 똑같이 보인다. 여기서 막는다.
+bool vl53l9_esp32_bus_begin(void) {
+  if (!Wire.begin(PIN_SDA, PIN_SCL, I2C_FREQ_HZ)) {
+    Serial.println(F("  !! Wire.begin 실패"));
+    return false;
+  }
+  if (Wire.setBufferSize(WIRE_BUF) != WIRE_BUF) {
+    Serial.printf("  !! Wire.setBufferSize(%d) 실패. 청크 전송이 조용히 잘린다.\n", WIRE_BUF);
+    return false;
+  }
   Wire.setTimeOut(100);
+  return true;
 }
 
 static inline uint8_t devAddr(void *const p_dev) {
@@ -59,13 +73,20 @@ extern "C" int vl53l9_read(void *const p_dev, uint16_t address,
     const uint32_t n = (size - done > CHUNK_BYTES) ? CHUNK_BYTES : (size - done);
     const uint16_t a = (uint16_t)(address + done);
 
+    // 인덱스 쓰기와 데이터 읽기 사이에 반드시 STOP 을 둔다 (repeated START 금지).
+    // VL53L9CX 는 write 직후 repeated START 로 이어지는 read 를 제대로 지원하지
+    // 않는다. ST 레퍼런스 플랫폼(HAL Transmit -> Receive)과 동작 확인된 ESP32-P4
+    // 구현 모두 두 트랜잭션으로 나눈다.
     Wire.beginTransmission(addr);
     Wire.write((uint8_t)(a >> 8));
     Wire.write((uint8_t)(a & 0xFF));
-    if (Wire.endTransmission(false) != 0) return VL53L9_ERROR_PLATFORM;
+    if (Wire.endTransmission(true) != 0) return VL53L9_ERROR_PLATFORM;
 
-    if (Wire.requestFrom((int)addr, (int)n, (int)true) != (int)n) return VL53L9_ERROR_PLATFORM;
-    for (uint32_t i = 0; i < n; i++) p_values[done + i] = Wire.read();
+    if ((int)Wire.requestFrom((int)addr, (int)n, (int)true) != (int)n) return VL53L9_ERROR_PLATFORM;
+    // requestFrom 이 n 을 리턴했더라도 available() 로 한 번 더 막는다.
+    // 모자란 상태에서 read() 는 -1 을 리턴하고 그게 0xFF 로 저장된다.
+    if ((uint32_t)Wire.available() < n) return VL53L9_ERROR_PLATFORM;
+    for (uint32_t i = 0; i < n; i++) p_values[done + i] = (uint8_t)Wire.read();
 
     done += n;
   }

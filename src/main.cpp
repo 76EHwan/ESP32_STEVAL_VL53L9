@@ -7,51 +7,17 @@
 //   없어도 측거 데이터를 받을 수 있는 이유다.
 //
 // 프레임 버퍼 레이아웃 (vl53l9_get_frame 기준):
-//   [0          .. res*2)     depth      zone 당 uint16, 리틀엔디안
-//   [res*2      .. res*4)     amplitude
-//   [res*4      .. res*6)     ambient
-//   [res*6      .. +res/2)    DSS LUT 인덱스
-//   [...        .. +100)      status line
-//
-// 설정 순서는 ST 예제의 vl53l9_utils_set_profile() 을 공개 API 로 그대로
-// 재현한 것이다 (그 함수는 SLA0111 인 vl53l9_interface.h 에 의존해서 가져올
-// 수 없다. 하는 일은 공개 API 호출 나열이라 재현이 어렵지 않다).
-//
-// 전제 조건: R25 제거 / R24 장착 (board_config.h 참고).
-//
-// === 현재 상태: 센서 하드웨어 이슈로 측거 불가 ===
-//
-// 소프트웨어 경로는 끝까지 동작한다.
-//   init(패치 9865B 설치) / device id 0x53334C39 / 설정 6종 / start -> STREAMING
-//   그리고 CSI2 모드에서는 프레임 카운터가 실제로 증가한다.
-//
-// 그런데 측거가 실패하고 FW 가 STANDBY 로 되돌아간다. 상태 라인을 읽어보면
-// 원인이 명확하다.
-//
-//   ref LONG   ch1 amp=0 dist=0     ch2 amp=0 dist=0
-//   ref SHORT  ch1 amp=0 dist=149   ch2 amp=0 dist=149
-//   temperature=32   ldd_temp=0
-//
-// VCSEL 2채널 모두 기준 진폭이 0 이다. 기준 SPAD 배열이 레이저 빛을 전혀
-// 받지 못한다. 같은 프레임에서 다이 온도는 32도로 정상 보고되므로 디지털·
-// 아날로그 코어는 살아 있다. 레이저만 안 켜진다.
-//
-// 전원은 확인했다. VBAT_LDD(P3V3)를 C6/C7 에서 측정해 3.3V 정상,
-// AVDD 2.8V / DVDD 1.2V / IOVDD 1.8V 모두 정상. PLL 도 동작한다
-// (get_calib_data 가 COMMAND_SWITCH_TO_FAST_CLOCK 을 거쳐 성공).
-//
-// 남은 가능성은 LGA 볼 개방 또는 센서 내부 손상이고, 둘 다 소프트웨어로
-// 구분할 수 없다. 이 보드는 EEPROM(U4)을 떼어낸 리워크 이력이 있다.
-//
-// 자세한 경위와 배제한 가설 전체는 docs/vl53l9cx-i2c-map.md,
-// ST 문의용 정리는 docs/st-community-question.md 참고.
-//
-// 하드웨어가 정상이면 이 코드는 그대로 depth 프레임을 출력한다.
+//   [0          .. res*2)    depth      zone 당 uint16, 리틀엔디안
+//   [res*2      .. res*4)    amplitude
+//   [res*4      .. res*6)    ambient
+//   [res*6      .. +res/2)   DSS LUT 인덱스
+//   [...        .. +100)     status line
 // ---------------------------------------------------------------------------
 
 #include <Arduino.h>
 
 #include "board_config.h"
+#include "i2c_diag.h"
 #include "vl53l9_esp32.h"
 
 extern "C" {
@@ -59,15 +25,56 @@ extern "C" {
 #include "vl53l9_platform.h"   // vl53l9_read / vl53l9_write (청크 검증용)
 }
 
+// 1 = 같은 STEVAL-VL53L9 에서 동작이 확인된 ESP32-P4 구현
+//     (kamibukuro5656/VL53L9CX_ESP32-P4_USB_ROS2) 의 기본 설정을 그대로 재현한다.
+//     이 설정으로도 폴트가 나면 호스트 코드 차이는 배제된다.
+#define REF_REPLICA       0
+
+#if REF_REPLICA
+#define PROF_SYNC         VL53L9_SYNC_AUTONOMOUS
+#define PROF_POWER        VL53L9_POWER_REGULAR
+#define PROF_CONTEXT      VL53L9_CONTEXT_SHORT
+#define PROF_FRAME_PERIOD 10000UL              // 10 ms
+#define PROF_BINNING      2                    // 54x42
+#define PROF_EXPOSURE_MS  4
+#define PROF_DSS_OFF      1
+#else
 // ST 의 AR_PRECISION 프로파일 값. sync 만 예제와 같이 MANUAL 로 덮어쓴다.
+#define PROF_SYNC         VL53L9_SYNC_MANUAL
 #define PROF_POWER        VL53L9_POWER_REGULAR   // ULTRA_LOW 는 I3C 웨이크 전제로 보임
 #define PROF_CONTEXT      VL53L9_CONTEXT_SHORT
 #define PROF_FRAME_PERIOD (1000000UL / 30UL)   // 30 fps
-#define PROF_BINNING      8                    // 12x10. binning 2 는 start 가 60ms 를 넘긴다
+#define PROF_BINNING      12                   // 8x8 (64존). binning 2 는 start 가 60ms 를 넘긴다
 #define PROF_EXPOSURE_MS  10
+#define PROF_DSS_OFF      0
+#endif
 
-#define USE_CSI_BISECT    0      // 1 = CSI2 로 측거만 시험하는 진단 모드
-                                 //     (프레임 수신 불가. REF_ARRAY 에러를 드러낸다)
+// 1 = 드라이버를 건드리기 전에 I2C 버스부터 진단한다.
+// 기본 0: 진단은 주소만 보내는 빈 트랜잭션(프로브)을 수십 번 보내는데, VL53L9CX 는
+// 이를 지원하지 않고 이후 전송을 NACK 할 수 있다. 배선을 의심할 때만 켠다.
+#define RUN_I2C_DIAG      0
+
+// 1 = init 전에 0x1800(패치 영역)에 4KB 를 써서 청크 분할 전송을 검증한다.
+// 플랫폼 계층을 바꿨을 때만 켠다. 참고 구현에는 없는 쓰기라 평소에는 끈다.
+#define RUN_CHUNK_TEST    0
+
+// 1 = CSI2 로 출력만 돌려놓고 측거 파이프라인만 시험한다 (프레임 수신은 불가).
+//
+// I3C 모드는 파이프라인이 시작되기 전에 0x0F00 으로 죽어 frame_counter 가
+// 0 에 머문다. 그래서 ref amplitude 가 기록되지 않아 VCSEL 발광 여부를
+// 판정할 수 없다. CSI2 모드만 frame_counter 가 올라가며 ref amp 를 채운다.
+#if REF_REPLICA
+#define USE_CSI_BISECT    1
+#else
+#define USE_CSI_BISECT    0
+#endif
+
+// 1 = 전류 측정 모드. 대기/측거를 10초씩 교대해 소비 전류 차이를 재게 한다.
+//
+// 실측 결과 판별력이 없었다. 폴트 직후 STANDBY 로 떨어져 STREAMING 체류
+// 시간이 짧고, 펌웨어가 9단계에서 중단되어 정상 부품이라도 발광 전류가
+// 거의 안 나온다. 두 구간 차이가 멀티미터 분해능 아래다.
+#define POWER_TEST_MODE   0
 
 #define FRAME_BUF_MAX     15000                // binning 2 기준 14842B
 
@@ -150,19 +157,6 @@ static void dumpStatus(const char *when) {
                 st.laser_driver[0], st.laser_driver[1], st.laser_driver[2],
                 st.laser_driver[3], st.laser_driver[4]);
 
-  // ---------------------------------------------------------------------
-  // 상태 라인 100바이트를 통째로 읽어 기준 채널 진폭을 본다.
-  //
-  // vl53l9_utils.h 의 프레임 메타데이터 구조체는 SENSOR_STATUS(0x0028)
-  // 영역의 직접 오버레이다. 레지스터 맵으로 검증됨:
-  //   frame_counter  offset 0    = REGADDR_FRAME_COUNTER (base + 0)
-  //   temperature    offset 4    = REGADDR_TEMPERATURE   (base + 0x04)
-  //   error_code     offset 60   = REGADDR_ERROR_CODE    (base + 0x3C)
-  //
-  // ref_amplitude 는 VCSEL 이 쏜 빛을 내부 기준 경로로 받은 세기다.
-  //   0 에 가까움 -> 레이저가 안 나오거나 기준 경로가 막혔다 (하드웨어)
-  //   유의미한 값 -> 레이저는 나온다. 다른 이유로 REF_ARRAY 가 선 것
-  // ---------------------------------------------------------------------
   uint8_t sl[100];
   if (vl53l9_read(&g_dev, 0x0028, sl, sizeof(sl)) != VL53L9_ERROR_NONE) return;
   #define U16(off) ((uint16_t)(sl[(off)] | ((uint16_t)sl[(off) + 1] << 8)))
@@ -180,30 +174,51 @@ static void dumpStatus(const char *when) {
   #undef U32
 }
 
+#if RUN_I2C_DIAG
+static void hardwareChecklist(void) {
+  banner("!! I2C 응답 없음 — 하드웨어 점검 순서");
+  Serial.println(F(
+    "  소프트웨어로 더 확인할 것이 없다. 센서가 주소 자체에 ACK 하지 않는다.\n\n"
+    "  1) R25 / R24  (가장 유력)\n"
+    "     R25 제거 + R24 장착 상태여야 Y1(12MHz) 이 AP_CLK 로 들어간다.\n\n"
+    "  2) J3 점퍼 (HOST_IOVDD 3V3 핀 확인)\n\n"
+    "  3) 전원 레일 (AVDD 2.8V / IOVDD 1.8V / DVDD 1.2V)\n\n"
+    "  4) XSHUT 배선 및 로직 레벨\n\n"
+    "  5) 센서 사망 의심 (이전 U4 리워크 이력 참고)"));
+}
+#endif
+
 void setup() {
   Serial.begin(SERIAL_BAUD);
   delay(500);
 
   banner("VL53L9CX 측거 (ST 드라이버 ESP32 포팅)");
-
-  g_dev.address = TOF_I2C_ADDR_7BIT;
-  enableSensor();
-  vl53l9_esp32_bus_begin();
+  Serial.println(F("  보드: ESP32 DevKit v1"));
   Serial.printf("  I2C %lu Hz, SDA=GPIO%d, SCL=GPIO%d, XSHUT=GPIO%d\n",
                 (unsigned long)I2C_FREQ_HZ, PIN_SDA, PIN_SCL, PIN_XSHUT);
 
-  // ---------------------------------------------------------------------
-  // 플랫폼 계층 청크 분할 쓰기 검증
-  //
-  // 펌웨어 패치는 9865바이트이고 Wire 버퍼보다 커서 여러 청크로 쪼개 보낸다.
-  // 이 경로가 미묘하게 틀리면 패치가 손상된 채 올라가고, 부팅은 되지만
-  // 측거 코드가 돌 때 죽는다. init 전에 먼저 확인한다.
-  //
-  // 대상은 0x1800 (패치 영역). 어차피 init 이 곧 덮어쓰므로 안전하다.
-  // ---------------------------------------------------------------------
+  g_dev.address = TOF_I2C_ADDR_7BIT;
+
+#if RUN_I2C_DIAG
+  if (!i2c_diag_run(TOF_I2C_ADDR_7BIT)) {
+    hardwareChecklist();
+    g_frame_size = 0;
+    return;
+  }
+  Serial.printf("\n  0x%02X ACK 확인. 드라이버 경로로 진행한다.\n", TOF_I2C_ADDR_7BIT);
+#endif
+
+  enableSensor();
+  if (!vl53l9_esp32_bus_begin()) {
+    Serial.println(F("  !! Wire 초기화 실패. 중단."));
+    g_frame_size = 0;
+    return;
+  }
+
+#if RUN_CHUNK_TEST
   banner("[사전] 청크 쓰기 검증");
   {
-    const uint32_t N = 4096;                       // 여러 청크에 걸치게
+    const uint32_t N = 4096; 
     static uint8_t tx[4096], rx[4096];
     for (uint32_t i = 0; i < N; i++) tx[i] = (uint8_t)(i * 7u + 3u);
 
@@ -218,56 +233,19 @@ void setup() {
     if (bad == 0) {
       Serial.println(F("  일치. 청크 분할 쓰기 정상."));
     } else {
-      Serial.printf("  !! 불일치 %lu / %lu, 첫 위치 오프셋 %ld (0x%04lX)\n",
-                    (unsigned long)bad, (unsigned long)N,
-                    (long)first, (unsigned long)(0x1800 + first));
-      Serial.printf("     기대 %02X  실제 %02X\n", tx[first], rx[first]);
+      Serial.printf("  !! 불일치 %lu / %lu, 첫 위치 오프셋 %ld\n", (unsigned long)bad, (unsigned long)N, (long)first);
     }
   }
+#endif
 
   banner("초기화");
 
-  // 부팅 + 펌웨어 패치(9865B) 설치
   STEP(vl53l9_init(&g_dev), "vl53l9_init (패치 설치 포함)");
 
   uint32_t id = 0;
   STEP(vl53l9_get_device_id(&g_dev, &id), "vl53l9_get_device_id");
   Serial.printf("    device id = 0x%08lX\n", (unsigned long)id);
 
-  // 출력 인터페이스 확인만 한다.
-  //
-  // 기본값이 이미 I3C(시리얼)라 되쓸 필요가 없다. 그리고 set_hw_config 는
-  // output_interface 뿐 아니라 CSI 관련 필드(data_rate, frame_width/height,
-  // virtual_channel, datatype, signaling_mode ...)를 한꺼번에 되쓴다.
-  // ST 의 i3c 예제도 이 함수를 호출하지 않는다. 건드리지 않는다.
-  // ---------------------------------------------------------------------
-  // [이분법] 출력 인터페이스를 CSI2 로 바꿔서 측거 파이프라인만 시험한다.
-  //
-  // MIPI 데이터를 받자는 게 아니다. ESP32 에는 CSI 수신기가 없다.
-  // 목적은 "FW 가 폴트를 내는가" 하나다. 프레임 카운터(0x0028)만 본다.
-  //
-  //   폴트 없이 카운터 증가 -> 측거 파이프라인 정상. 문제는 시리얼 출력 한정
-  //   똑같이 internal_fw 폴트 -> 출력 방식과 무관. 측거 자체의 문제
-  // ---------------------------------------------------------------------
-  vl53l9_hw_config_t hw;
-  STEP(vl53l9_get_hw_config(&g_dev, &hw), "vl53l9_get_hw_config");
-  Serial.printf("    output_interface (기본) = %s\n", hw.output_interface ? "I3C(시리얼)" : "CSI2");
-#if USE_CSI_BISECT
-  hw.output_interface = false;   // CSI2
-  STEP(vl53l9_set_hw_config(&g_dev, hw), "vl53l9_set_hw_config (-> CSI2)");
-  Serial.println(F("  ** 이분법 모드: CSI2 로 측거만 시험한다 (프레임 수신 불가) **"));
-#endif
-
-  // ---------------------------------------------------------------------
-  // [진단] 캘리브레이션 읽기 = PLL + 온칩 캘리브레이션 동시 점검
-  //
-  // get_calib_data 는 내부적으로 COMMAND_SWITCH_TO_FAST_CLOCK 을 보내
-  // PLL 을 켜고 시스템 클럭을 고속으로 바꾼 뒤, OTP 미러 2332바이트를 읽고
-  // 다시 외부 클럭으로 되돌린다. 측거가 쓰는 것과 같은 PLL 이다.
-  //
-  //   실패 -> PLL/클럭 문제. 측거 폴트의 원인일 가능성이 크다
-  //   성공 -> PLL 정상. 캘리브레이션 내용으로 U4 리워크 영향도 볼 수 있다
-  // ---------------------------------------------------------------------
   banner("[진단] 캘리브레이션 + PLL(고속 클럭 전환)");
   {
     static uint8_t calib[VL53L9_CALIB_DATA_SIZE];
@@ -275,32 +253,33 @@ void setup() {
     Serial.printf("  vl53l9_get_calib_data -> %s\n", errText(ce));
     if (ce == VL53L9_ERROR_NONE) {
       uint32_t nz = 0, ff = 0;
+      uint32_t fnv = 2166136261UL;   // FNV-1a. 다이별 OTP 라 소자 지문으로 쓴다
       for (uint32_t i = 0; i < VL53L9_CALIB_DATA_SIZE; i++) {
         if (calib[i]) nz++;
         if (calib[i] == 0xFF) ff++;
+        fnv = (fnv ^ calib[i]) * 16777619UL;
       }
       Serial.printf("  %u 바이트 중 non-zero %lu, 0xFF %lu\n",
                     VL53L9_CALIB_DATA_SIZE, (unsigned long)nz, (unsigned long)ff);
-      Serial.print(F("  앞 32B: "));
-      for (int i = 0; i < 32; i++) Serial.printf("%02X ", calib[i]);
-      Serial.println();
-      if (nz == 0) Serial.println(F("  !! 전부 0. 캘리브레이션이 비어 있다."));
-    } else {
-      Serial.println(F("  !! 실패. 고속 클럭 전환(PLL) 또는 버스트 읽기 문제."));
+      Serial.printf("  calib 지문(FNV-1a) = %08lX\n", (unsigned long)fnv);
     }
-    dumpStatus("calib 직후");
   }
 
   banner("프로파일 적용 (ST AR_PRECISION)");
 
-  STEP(vl53l9_set_power_mode(&g_dev, PROF_POWER),   "vl53l9_set_power_mode (REGULAR)");
-  STEP(vl53l9_set_frame_period(&g_dev, PROF_FRAME_PERIOD),
-                                                     "vl53l9_set_frame_period (30fps)");
-  STEP(vl53l9_set_context(&g_dev, PROF_CONTEXT),     "vl53l9_set_context (SHORT)");
+  Serial.printf("  sync=%s  period=%lu us  binning=%d  exposure=%d ms  DSS=%s\n",
+                PROF_SYNC == VL53L9_SYNC_MANUAL ? "MANUAL" : "AUTONOMOUS",
+                (unsigned long)PROF_FRAME_PERIOD, PROF_BINNING, PROF_EXPOSURE_MS,
+                PROF_DSS_OFF ? "끔" : "기본");
+  STEP(vl53l9_set_sync_mode(&g_dev, PROF_SYNC),       "vl53l9_set_sync_mode");
+  STEP(vl53l9_set_power_mode(&g_dev, PROF_POWER),     "vl53l9_set_power_mode (REGULAR)");
+  STEP(vl53l9_set_frame_period(&g_dev, PROF_FRAME_PERIOD), "vl53l9_set_frame_period");
+  STEP(vl53l9_set_context(&g_dev, PROF_CONTEXT),      "vl53l9_set_context (SHORT)");
   STEP(vl53l9_set_binning(&g_dev, PROF_CONTEXT, PROF_BINNING), "vl53l9_set_binning");
-  STEP(vl53l9_set_exposure(&g_dev, PROF_CONTEXT, PROF_EXPOSURE_MS),
-                                                     "vl53l9_set_exposure (10ms)");
-  STEP(vl53l9_set_sync_mode(&g_dev, VL53L9_SYNC_MANUAL), "vl53l9_set_sync_mode (MANUAL)");
+#if PROF_DSS_OFF
+  STEP(vl53l9_set_dss_mode(&g_dev, PROF_CONTEXT, 0),  "vl53l9_set_dss_mode (끔)");
+#endif
+  STEP(vl53l9_set_exposure(&g_dev, PROF_CONTEXT, PROF_EXPOSURE_MS), "vl53l9_set_exposure");
 
   STEP(vl53l9_get_raw_buffer_size(PROF_BINNING, &g_frame_size), "vl53l9_get_raw_buffer_size");
   if (!binningToWH(PROF_BINNING, &g_w, &g_h) || g_frame_size > FRAME_BUF_MAX) {
@@ -311,30 +290,39 @@ void setup() {
   Serial.printf("    binning %d -> %ux%u (%u존), 프레임 %u 바이트\n",
                 PROF_BINNING, g_w, g_h, g_w * g_h, g_frame_size);
 
-  // start 전 실제 설정값을 읽어본다. FW 가 +0ms 에 설정을 거부하므로
-  // 무엇이 비어 있는지 보는 게 핵심이다.
-  banner("[진단] start 직전 설정 레지스터");
+  // 출력 인터페이스는 프로파일 "다음"에 정한다. 동작 확인된 ESP32-P4 구현과
+  // ST 프로파일 헬퍼가 이 순서를 쓴다.
+  vl53l9_hw_config_t hw;
+  STEP(vl53l9_get_hw_config(&g_dev, &hw), "vl53l9_get_hw_config");
+  Serial.printf("    output_interface (기본) = %s\n", hw.output_interface ? "I3C(시리얼)" : "CSI2");
+  hw.signaling_mode = true;          // 인터럽트 패드 사용 (I2C 호스트라 IBI 불가)
+#if USE_CSI_BISECT
   {
-    uint8_t b[0x100];
-    if (vl53l9_read(&g_dev, 0x0460, b, 0xC0) == VL53L9_ERROR_NONE) {
-      for (uint16_t off = 0; off < 0xC0; off += 16) {
-        bool any = false;
-        for (int k = 0; k < 16; k++) if (b[off + k]) { any = true; break; }
-        if (!any) continue;
-        Serial.printf("  %04X  ", 0x0460 + off);
-        for (int k = 0; k < 16; k++) Serial.printf("%02X ", b[off + k]);
-        Serial.println();
-      }
-    }
-    uint8_t sn = 0xAA;
-    vl53l9_read8(&g_dev, 0x04CC, &sn);          // STREAM_STEP_NUMBER (SHORT)
-    Serial.printf("  STREAM_STEP_NUMBER(SHORT, 0x04CC) = %u\n", sn);
-    uint32_t shots0 = 0;
-    vl53l9_read32(&g_dev, 0x0504, &shots0);     // NB_SHOT_STEP(1, SHORT)
-    Serial.printf("  NB_SHOT_STEP(1,SHORT, 0x0504) = %lu\n", (unsigned long)shots0);
+    // 동작 확인된 ESP32-P4 구현과 같은 값. 한 줄 100B, depth/amp/ambient + DSS 를 담는 높이.
+    const uint32_t px = (uint32_t)g_w * g_h;
+    hw.output_interface            = false;
+    hw.interrupt_pad_mode          = true;
+    hw.csi_status_line_force_width = false;
+    hw.csi_data_rate               = 1000UL * 1000000UL;
+    hw.csi_virtual_channel         = 0;
+    hw.csi_status_line_datatype    = 0x2A;
+    hw.csi_frame_datatype          = 0x2A;
+    hw.csi_frame_width             = 100;
+    hw.csi_frame_height            = (uint16_t)((px * 6U + px / 2U + 99U) / 100U);
   }
+  STEP(vl53l9_set_hw_config(&g_dev, hw), "vl53l9_set_hw_config (-> CSI2)");
+  Serial.println(F("  ** 이분법 모드: CSI2 로 측거만 시험한다 (프레임 수신 불가) **"));
+#else
+  hw.output_interface = true;
+  STEP(vl53l9_set_hw_config(&g_dev, hw), "vl53l9_set_hw_config (-> I3C)");
+#endif
 
-  STEP(vl53l9_start(&g_dev), "vl53l9_start");
+  {
+    // AUTONOMOUS 는 start 명령 완료가 60ms 를 넘길 수 있다 (참고 구현도 TIMEOUT 을
+    // 허용하고 STREAMING 을 따로 기다린다). 그래서 여기서는 실패로 끊지 않는다.
+    const int se = vl53l9_start(&g_dev);
+    Serial.printf("  %-36s %s\n", "vl53l9_start", errText(se));
+  }
   delay(100);
   dumpStatus("start 직후");
 
@@ -344,25 +332,71 @@ void setup() {
 void loop() {
   if (g_frame_size == 0) { delay(2000); return; }
 
+#if POWER_TEST_MODE
+  // ---------------------------------------------------------------------
+  // 전류 측정 모드 — VCSEL 이 실제로 전류를 끄는지 본다.
+  //
+  // 레지스터에는 "레이저 드라이버 고장" 플래그가 없다. 그래서 발광 여부를
+  // 전류로 직접 확인한다. 대기(STANDBY)와 연속 측거를 10초씩 교대하며,
+  // 두 구간의 소비 전류 차이를 멀티미터로 읽으면 된다.
+  //
+  //   차이 있음 -> VCSEL 이 전류를 끈다. B1 은 붙어 있다
+  //   차이 없음 -> VBAT_LDD 경로가 죽었다
+  //
+  // 단발 프레임은 노출이 10ms 뿐이라 멀티미터가 못 잡는다. 측거 구간에서는
+  // 폴트로 STANDBY 에 떨어질 때마다 즉시 재시작해 듀티를 최대로 올린다.
+  // ---------------------------------------------------------------------
+  {
+    static int8_t  phase = -1;            // -1 미초기화 / 0 대기 / 1 측거
+    static uint32_t phaseStart = 0;
+    const uint32_t PHASE_MS = 10000;
+
+    if (phase < 0) {
+      vl53l9_stop(&g_dev);
+      phase = 0;
+      phaseStart = millis();
+      Serial.println(F("\n>>> [대기] STANDBY — 기준 전류를 읽으세요 (10초)"));
+    } else if (millis() - phaseStart >= PHASE_MS) {
+      phase = (phase == 0) ? 1 : 0;
+      phaseStart = millis();
+      if (phase == 1) {
+        Serial.println(F("\n>>> [측거] 연속 프레임 — 전류를 읽으세요 (10초)"));
+      } else {
+        vl53l9_stop(&g_dev);
+        Serial.println(F("\n>>> [대기] STANDBY — 기준 전류를 읽으세요 (10초)"));
+      }
+    }
+
+    if (phase == 1) {
+      vl53l9_status_t st;
+      if (vl53l9_get_status(&g_dev, &st) == VL53L9_ERROR_NONE && st.fsm != 3) {
+        vl53l9_stop(&g_dev);
+        delay(2);
+        vl53l9_start(&g_dev);
+        delay(2);
+      }
+      vl53l9_trigger_frame(&g_dev);
+      delay(12);                          // 노출 10ms 를 덮는다
+    } else {
+      delay(50);
+    }
+    return;
+  }
+#endif
+
 #if USE_CSI_BISECT
-  // CSI2 모드에서는 프레임을 못 받는다. FW 가 죽는지, 프레임 카운터가
-  // 올라가는지만 본다.
+  // CSI-2 모드 디버깅 로직 (현재는 비활성화됨)
   uint32_t fc0 = 0, fc1 = 0;
-  vl53l9_read32(&g_dev, 0x0028, &fc0);            // FRAME_COUNTER
-
+  vl53l9_read32(&g_dev, 0x0028, &fc0);
   int e = vl53l9_trigger_frame(&g_dev);
-  Serial.printf("trigger_frame -> %s\n", errText(e));
-
   delay(300);
-
   vl53l9_read32(&g_dev, 0x0028, &fc1);
-  Serial.printf("  FRAME_COUNTER %lu -> %lu  (증가 %ld)\n",
-                (unsigned long)fc0, (unsigned long)fc1, (long)(fc1 - fc0));
   dumpStatus("트리거 300ms 후");
-  Serial.println(F("---------------------------------------------------"));
   delay(1200);
-  return;
 #else
+  // -------------------------------------------------------------------------
+  // 수정됨: 하드코딩된 대기 시간을 제거하고 타임아웃 기반의 동적 폴링 구조 적용
+  // -------------------------------------------------------------------------
   int e = vl53l9_trigger_frame(&g_dev);
   if (e != VL53L9_ERROR_NONE) {
     Serial.printf("trigger_frame 실패: %s\n", errText(e));
@@ -370,26 +404,49 @@ void loop() {
     delay(2000);
     return;
   }
-  delay(200);
-  dumpStatus("무통신 200ms 후");
+
   uint8_t ready = 0;
-  e = vl53l9_poll_frame(&g_dev, &ready);
-  Serial.printf("  poll_frame -> %s, ready=%u\n", errText(e), ready);
-  if (!ready) { delay(1500); return; }
+  uint32_t start_ms = millis();
+  
+  // 프레임 데이터가 준비될 때까지 최대 500ms 동안 폴링
+  while (!ready && (millis() - start_ms < 500)) {
+    e = vl53l9_poll_frame(&g_dev, &ready);
+    if (e != VL53L9_ERROR_NONE) {
+      Serial.printf("  poll_frame 통신 에러: %s\n", errText(e));
+      break;
+    }
+    if (!ready) {
+      delay(5); // I2C 버스 부하를 줄이기 위한 짧은 대기
+    }
+  }
+
+  if (!ready) {
+    Serial.println("poll_frame 타임아웃 (센서가 데이터를 준비하지 않음)");
+    dumpStatus("폴링 타임아웃 상태");
+    delay(1500);
+    return;
+  }
+
+  // 데이터 준비가 확인되면 프레임 버퍼 읽어오기
   e = vl53l9_get_frame(&g_dev, g_frame, g_frame_size);
   if (e != VL53L9_ERROR_NONE) {
     Serial.printf("get_frame 실패: %s\n", errText(e));
     delay(1500);
     return;
   }
+
+  // Depth 데이터 파싱 및 시리얼 모니터 출력
   const uint16_t *depth = (const uint16_t *)g_frame;
   Serial.printf("\n--- depth %ux%u, 중앙 %u mm ---\n",
                 g_w, g_h, depth[(g_h / 2) * g_w + (g_w / 2)]);
   for (uint16_t y = 0; y < g_h; y++) {
     Serial.print("  ");
-    for (uint16_t x = 0; x < g_w; x++) Serial.printf("%6u", depth[y * g_w + x]);
+    for (uint16_t x = 0; x < g_w; x++) {
+      Serial.printf("%6u", depth[y * g_w + x]);
+    }
     Serial.println();
   }
-  delay(1000);
+  
+  delay(33); // 30fps(약 33ms) 주기에 맞춘 대기
 #endif
 }

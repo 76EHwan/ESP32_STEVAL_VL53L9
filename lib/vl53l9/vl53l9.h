@@ -291,6 +291,12 @@ int vl53l9_get_binning(void *const p_dev, vl53l9_context_t context, uint8_t *p_b
 int vl53l9_set_binning(void *const p_dev, vl53l9_context_t context, uint8_t binning);
 
 /**
+ * @brief Update the Dynamic SPAD Selection mode (0 = disabled, 1 = long, 2 = short)
+ * @note set_binning() restores the context's default DSS mode, so call this after it
+ */
+int vl53l9_set_dss_mode(void *const p_dev, vl53l9_context_t context, uint8_t mode);
+
+/**
  * @brief Retrieve the current exposure time (in milliseconds) for a given context
  * @param[in] p_dev Opaque pointer used for register level operations
  * @param[in] context Selected context

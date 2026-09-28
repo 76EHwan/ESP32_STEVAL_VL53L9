@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 // 온보드 Y1 발진기 주파수. R25 를 제거해야 실제로 동작한다.
@@ -21,7 +22,8 @@ extern "C" {
 #endif
 
 // Wire 초기화 + 버퍼/타임아웃 설정. 드라이버를 쓰기 전에 한 번 호출한다.
-void vl53l9_esp32_bus_begin(void);
+// 반환값 false 면 버스를 쓸 수 없는 상태다 (begin 실패 또는 버퍼 할당 실패).
+bool vl53l9_esp32_bus_begin(void);
 
 #ifdef __cplusplus
 }

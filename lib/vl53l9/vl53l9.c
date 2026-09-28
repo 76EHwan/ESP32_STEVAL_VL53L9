@@ -144,6 +144,7 @@ static const uint8_t dithering_long[7] = { 31, 31, 31, 31, 31, 31, 0 };
 /* private functions prototypes **********************************************/
 
 static _fsm_state_t _get_fsm_state(void *const p_dev);
+static int _read_fsm_state(void *const p_dev, _fsm_state_t *p_state);
 static int _wait_for_state(void *const p_dev, _fsm_state_t state, uint32_t timeout_ms);
 static int _write_cmd(void *const p_dev, _command_t cmd, uint32_t timeout_ms);
 static int _init_default_config(void *const p_dev);
@@ -338,7 +339,8 @@ int vl53l9_set_hw_config(void *const p_dev, vl53l9_hw_config_t config) {
     CHECK_RET(ret);
     ret = vl53l9_write8(p_dev, VL53L9_REGADDR_CSI2_VIRTUAL_CHANNEL, config.csi_virtual_channel);
     CHECK_RET(ret);
-    status_line_cfg = (((uint16_t)config.csi_status_line_datatype & 0x2fU) |
+    // ESP32 포팅 수정: 원본 마스크 0x2F 는 데이터 타입 bit4 를 버린다 (필드는 GENMASK(5,0))
+    status_line_cfg = (((uint16_t)config.csi_status_line_datatype & (uint16_t)VL53L9_REGFIELD_CSI2_ISL_DATA_TYPE) |
                        (((uint16_t)config.csi_status_line_force_width & 1U) << 6));
     ret = vl53l9_write16(p_dev, VL53L9_REGADDR_CSI2_ISL, status_line_cfg);
     CHECK_RET(ret);
@@ -506,6 +508,19 @@ int vl53l9_set_binning(void *const p_dev, vl53l9_context_t context, uint8_t binn
 
     ret = _write_crop_config(p_dev, &crop);
     return ret;
+}
+
+// ESP32 포팅 추가: 동작 확인된 ESP32-P4 구현에서 가져옴. set_binning 이 DSS 를 컨텍스트
+// 기본값으로 되돌리므로 binning 다음에 호출한다. mode: 0=끔 1=LONG 2=SHORT
+int vl53l9_set_dss_mode(void *const p_dev, vl53l9_context_t context, uint8_t mode) {
+    CHECK_NULL_PTR(p_dev);
+    if ((context > VL53L9_CONTEXT_LONG) || (mode > (uint8_t)DSS_SHORT)) {
+        return VL53L9_ERROR_INVALID_PARAM;
+    }
+    if (_get_fsm_state(p_dev) != FSM_STATE_STANDBY) {
+        return VL53L9_ERROR_INVALID_STATE;
+    }
+    return vl53l9_write8(p_dev, VL53L9_REGADDR_STANDBY_DSS_MODE((uint16_t)context), mode);
 }
 
 int vl53l9_get_exposure(void *const p_dev, vl53l9_context_t context, uint16_t *p_exposure_ms) {
@@ -866,29 +881,45 @@ int vl53l9_get_raw_buffer_size(uint8_t binning, uint16_t *p_size) {
 
 /* private functions implementation ******************************************/
 
+// ESP32 포팅 수정: 원본 _get_fsm_state 는 read8 의 반환값을 버린다.
+// 그래서 I2C 가 완전히 죽어 있어도 "상태가 0" 으로 보이고, 호출자는 전부
+// TIMEOUT / INVALID_STATE 를 리턴한다. 실제로 버스 무응답이 vl53l9_init 의
+// "타임아웃" 으로 둔갑해 원인 파악을 한 단계 늦췄다.
+// 에러를 전달하는 버전을 따로 두고, 기존 시그니처는 그대로 남긴다.
+static int _read_fsm_state(void *const p_dev, _fsm_state_t *p_state) {
+    uint8_t data = 0;
+    int ret = vl53l9_read8(p_dev, VL53L9_REGADDR_SYSTEM_FSM, &data);
+    CHECK_RET(ret);
+    *p_state = (_fsm_state_t)data;
+    return VL53L9_ERROR_NONE;
+}
+
+// NOTE: 이 함수를 쓰는 상태 가드(_get_fsm_state() != FSM_STATE_STANDBY 형태)는
+// I2C 실패를 VL53L9_ERROR_INVALID_STATE 로 보고한다. 부팅 경로만큼 치명적이지
+// 않아 원본 시그니처를 유지했다.
 static _fsm_state_t _get_fsm_state(void *const p_dev) {
     _fsm_state_t state = FSM_STATE_NONE; // ESP32 포팅: 상동
-    (void)vl53l9_read8(p_dev, VL53L9_REGADDR_SYSTEM_FSM, (uint8_t *)&state);
+    (void)_read_fsm_state(p_dev, &state);
     return state;
 }
 
 static int _wait_for_state(void *const p_dev, _fsm_state_t state, uint32_t timeout_ms) {
-    int ret = VL53L9_ERROR_NONE;
+    int ret;
     uint32_t elapsed_time_ms = 0;
-    _fsm_state_t current_state;
+    _fsm_state_t current_state = FSM_STATE_NONE;
 
     CHECK_NULL_PTR(p_dev);
     do {
         (void)vl53l9_wait_ms(p_dev, 1);
         elapsed_time_ms++;
-        current_state = _get_fsm_state(p_dev);
+        // ESP32 포팅 수정: I2C 오류를 TIMEOUT 으로 뭉개지 않고 그대로 올린다.
+        ret = _read_fsm_state(p_dev, &current_state);
+        CHECK_RET(ret);
     } while ((current_state != state) && (elapsed_time_ms < timeout_ms));
 
-    if (elapsed_time_ms >= timeout_ms) {
-        ret = VL53L9_ERROR_TIMEOUT;
-    }
-
-    return ret;
+    // ESP32 포팅 수정: 원본은 elapsed >= timeout 만 보기 때문에, 마지막
+    // 반복에서 상태에 도달해도 TIMEOUT 을 리턴했다 (off-by-one).
+    return (current_state == state) ? VL53L9_ERROR_NONE : VL53L9_ERROR_TIMEOUT;
 }
 
 static int _write_cmd(void *const p_dev, _command_t cmd, uint32_t timeout_ms) {
@@ -900,21 +931,23 @@ static int _write_cmd(void *const p_dev, _command_t cmd, uint32_t timeout_ms) {
     ret = vl53l9_write8(p_dev, VL53L9_REGADDR_COMMAND, (uint8_t)cmd);
     CHECK_RET(ret);
 
-    do {
-        ret = vl53l9_read8(p_dev, VL53L9_REGADDR_COMMAND, (uint8_t *)&current_cmd);
+    // ESP32 포팅 수정: 원본은 마지막 wait 이후 COMMAND 를 다시 읽지 않고
+    // 루프를 빠져나가서, 제한 시각에 딱 완료된 명령을 TIMEOUT 으로 보고했다.
+    // 조건을 <= 로 바꿔 마지막 폴링을 살린다.
+    for (;;) {
+        uint8_t data = 0;
+        ret = vl53l9_read8(p_dev, VL53L9_REGADDR_COMMAND, &data);
         CHECK_RET(ret);
+        current_cmd = (_command_t)data;
         if (current_cmd == COMMAND_NONE) { // avoid delay if not nessesary
-            break;
+            return VL53L9_ERROR_NONE;
+        }
+        if (elapsed_time_ms >= timeout_ms) {
+            return VL53L9_ERROR_TIMEOUT;
         }
         (void)vl53l9_wait_ms(p_dev, 1);
         elapsed_time_ms++;
-    } while ((elapsed_time_ms < timeout_ms));
-
-    if (elapsed_time_ms >= timeout_ms) {
-        return VL53L9_ERROR_TIMEOUT;
     }
-
-    return ret;
 }
 
 static int _init_default_config(void *const p_dev) {
