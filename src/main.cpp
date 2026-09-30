@@ -27,6 +27,9 @@ using namespace vl53l9cx;
 // 이만큼의 프레임마다 깊이 맵을 문자로 찍는다 (0 = 안 찍음)
 #define ASCII_MAP_EVERY  5
 
+// 1 = 부팅 직후, 스트리밍 시작 직후, 첫 폴트 직후에 상태/설정/OTP 레지스터를 전부 덤프
+#define DUMP_ALL_REGS    1
+
 constexpr size_t kWireBuffer = 256;
 constexpr size_t kFrameMax   = 14842;     // 54x42 기준
 
@@ -124,6 +127,72 @@ static void printLddFlags(const uint8_t ldd[5]) {
     }
   }
   if (!any) Serial.println(F("      레이저 드라이버 에러 플래그 없음"));
+}
+
+// UM3683 의 상태/설정/OTP 미러 중 진단에 쓸 만한 레지스터. 읽기만 한다.
+// 대기 상태의 긴 버스트 읽기는 고속 클럭이 필요할 수 있어 항목별로 짧게 읽는다.
+struct RegItem { const char *name; uint16_t addr; uint8_t size; };
+static const RegItem kRegs[] = {
+    {"DEVICE_MODEL_ID",          0x0000, 4},
+    {"DEVICE_REVISION",          0x0004, 4},
+    {"UI_REVISION",              0x0008, 2},
+    {"ROM_REVISION",             0x000A, 2},
+    {"PATCH_REVISION",           0x000C, 2},
+    {"FRAME_COUNTER",            0x0028, 4},
+    {"TEMPERATURE",              0x002C, 2},
+    {"LDD_TEMPERATURE",          0x002E, 2},
+    {"CURRENT_FRAME_WIDTH",      0x005C, 2},
+    {"CURRENT_FRAME_HEIGHT",     0x005E, 2},
+    {"CURRENT_STATIC_SETTINGS",  0x0060, 1},
+    {"AMBIENT_ATTENUATION",      0x0061, 1},
+    {"CURRENT_DYNAMIC_SETTINGS", 0x0062, 2},
+    {"ERROR_CODE",               0x0064, 2},
+    {"ERROR_STATUS",             0x0066, 1},
+    {"LDD_ERROR_STATUS_1..5",    0x0067, 5},
+    {"CURRENT_FRAME_PERIOD",     0x006C, 4},
+    {"CROP_DSS_STATUS",          0x0070, 4},
+    {"NB_SHOT_STEP_1",           0x0074, 3},
+    {"NB_SHOT_STEP_4_5",         0x0077, 3},
+    {"NB_SHOT_STEP_6",           0x007A, 3},
+    {"NB_SHOT_STEP_7",           0x007D, 3},
+    {"SYSTEM_FSM",               0x008C, 1},
+    {"COMMAND_ERROR",            0x008D, 1},
+    {"FRAME_READY",              0x008E, 1},
+    {"XSTART / YSTART",          0x008F, 2},
+    {"FINAL_WIDTH / HEIGHT",     0x0091, 2},
+    {"EXT_CLOCK",                0x042C, 4},
+    {"LDD_OTP_CRC",              0x0434, 4},
+    {"VDDA_CFG / VDDIO_CFG",     0x0438, 2},
+    {"NVM_MODULE_ID",            0x06E8, 4},
+    {"GLOBAL_DISTANCE_OFFSET",   0x06EC, 2},
+    {"OPTICAL_OFFSET_X / Y",     0x0B08, 2},
+    {"CAL_TEMP_DEGC",            0x0B0C, 1},
+    {"AUTO_VHV_TRIM_VOLTAGE",    0x0B10, 2},
+    {"AUTO_VHV_TRIM_TEMP",       0x0B12, 1},
+    {"BG_TRIM_IBIAS / VREF",     0x0B14, 2},
+    {"AUTO_VHV_IDAC_SEL_FMT",    0x0B18, 1},
+    {"AUTO_VHV_TEMP_FMT",        0x0B19, 1},
+    {"REF_ARRAY_CHECK",          0x0B1C, 4},
+    {"REF_ARRAY_SPAD_EN",        0x0B20, 3},
+    {"CAL_AMP_DISTANCE",         0x0CA4, 2},
+    {"I2C_SLAVE_ID",             0x0CE8, 1},
+};
+
+static void dumpAllRegs(const char *when) {
+  Serial.printf("  [레지스터 덤프: %s]\n", when);
+  for (const RegItem &r : kRegs) {
+    uint8_t b[8] = {0};
+    const Err e = g_dev.read(r.addr, b, r.size);
+    Serial.printf("    0x%04X %-26s ", r.addr, r.name);
+    if (e != Err::Ok) { Serial.printf("읽기 실패 (%s)\n", errName(e)); continue; }
+    for (int i = 0; i < r.size; i++) Serial.printf("%02X ", b[i]);
+    if (r.size == 2 || r.size == 4) {
+      uint32_t v = 0;
+      for (int i = r.size - 1; i >= 0; i--) v = (v << 8) | b[i];
+      Serial.printf("%*s= %lu", (4 - r.size) * 3, "", (unsigned long)v);
+    }
+    Serial.println();
+  }
 }
 
 // UM3683 2.4: 레이저 안전 에러 후 LDD 는 safe mode 에 들어간다. start() 만 다시
@@ -298,6 +367,7 @@ void setup() {
   Serial.printf("    업로드 %lu ms\n", (unsigned long)g_dev.firmwareLoadMs());
   if (!step(g_dev.boot(), "boot")) { dumpStatus("boot 실패"); return; }
   Serial.printf("    patch %u.%u\n", g_dev.patchMajor(), g_dev.patchMinor());
+  if (DUMP_ALL_REGS) dumpAllRegs("boot 직후 STANDBY");
 
   banner("설정");
   Serial.printf("  %s  ctx=%s  power=%s  sync=%s  exposure=%d ms  period=%lu us\n",
@@ -311,6 +381,7 @@ void setup() {
 
   if (!step(g_dev.start(), "start")) { dumpStatus("start 실패"); return; }
   dumpStatus("start 직후");
+  if (DUMP_ALL_REGS) dumpAllRegs("start 직후 STREAMING");
 
   banner("측거");
   g_ready = true;
@@ -334,6 +405,7 @@ void loop() {
 
   Serial.printf("프레임 실패: %s\n", errName(e));
   dumpStatus("실패");
+  if (DUMP_ALL_REGS && fails == 0) dumpAllRegs("첫 폴트 직후");
   // 폴트 후에는 XSHUT 부터 전부 다시 올려 재현되는지 본다 (UM3683 2.4).
   if (++fails <= 3) {
     Serial.printf("  재부팅 후 재시작 %lu/3: %s\n", (unsigned long)fails, errName(rebootAndStart()));
