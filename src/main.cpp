@@ -32,6 +32,9 @@ static const Resolution *g_res = nullptr;
 static uint8_t g_frame[kFrameMax];
 static bool g_ready = false;
 
+static const char *fwErrorName(uint16_t code);
+static void printLddFlags(const uint8_t ldd[5]);
+
 static void banner(const char *title) {
   Serial.println();
   Serial.println(F("==================================================="));
@@ -54,6 +57,7 @@ static void dumpStatus(const char *when) {
   const uint8_t es = st.error_status;
   Serial.printf("  [%s] fsm=%u(%s) command_err=0x%02X error_code=0x%04X error_status=0x%02X\n",
                 when, st.fsm, fsmName(st.fsm), st.command_error, st.error_code, es);
+  Serial.printf("    error_code 0x%04X = %s\n", st.error_code, fwErrorName(st.error_code));
   Serial.printf("    fw=%u ref_array=%u pll=%u sof=%u i_limit=%u spad_ovl=%u vhv_uv=%u vhv_ov=%u\n",
                 (es >> 7) & 1, (es >> 6) & 1, (es >> 5) & 1, (es >> 4) & 1,
                 (es >> 3) & 1, (es >> 2) & 1, (es >> 1) & 1, es & 1);
@@ -61,10 +65,63 @@ static void dumpStatus(const char *when) {
                 st.ldd_status[0], st.ldd_status[1], st.ldd_status[2], st.ldd_status[3],
                 st.ldd_status[4], (unsigned long)st.frame_counter, st.temperature,
                 st.ldd_temperature);
+  printLddFlags(st.ldd_status);
   Serial.printf("    ref LONG  amp %u/%u dist %u/%u | ref SHORT amp %u/%u dist %u/%u\n",
                 st.ref_long_amp[0], st.ref_long_amp[1], st.ref_long_dist[0], st.ref_long_dist[1],
                 st.ref_short_amp[0], st.ref_short_amp[1], st.ref_short_dist[0],
                 st.ref_short_dist[1]);
+}
+
+// UM3683 Table 18. LDD_ERROR_STATUS_1..5 (0x0067..0x006B) 의 비트 이름
+static const char *const kLddFlags[5][8] = {
+    {"skin_safety(PD 상한 초과)", "dif_removal(PD 하한 미만)", "power_high", "temp_high",
+     "temp_low", "ton(APC gate 너무 김)", "toff(APC gate 너무 짧음)", nullptr},
+    {"max_pulse_num", "freq_cross_check", "bandgap", "ldvcc_too_high", "ldvcc_too_low",
+     "ldvcc_short_to_gnd", "ldout_short_to_ldvcc_ch0", "ldout_short_to_ldgnd_ch0"},
+    {"oc_det(과전류)", "oc_det_self_test", "trace_short_to_vdda", "trace_short_to_vddio",
+     "trace_short_to_gnd", "trace_open", "trace_self_test", "als_det"},
+    {"vddio_under", "vdda_under", "vddio_over", "vdda_over", "watchdog_ch0", "crc_check",
+     "oc_clamp", "lvds_hiz(LVDS short/open)"},
+    {"ldout_short_to_ldvcc_ch1", "ldout_short_to_ldgnd_ch1", "watchdog_ch1", nullptr, nullptr,
+     nullptr, nullptr, nullptr},
+};
+
+// UM3683 Table 17 중 이 보드에서 실제로 본 코드
+static const char *fwErrorName(uint16_t code) {
+  switch (code) {
+    case 0x0000: return "NO_ERROR";
+    case 0x0008: return "TOP_ERROR_LDD_TIMEOUT (LDD 가 safe mode, 재부팅 필요)";
+    case 0x000D: return "TOP_ERROR_LDD_SAFETY";
+    case 0x0903: return "CSI2TX_ERROR_UNDERFLOW";
+    case 0x0F00: return "CABDT_ERROR_LDD_FAULT (레이저 드라이버 에러 확인)";
+    case 0x0F05: return "CABDT_ERROR_VHV_TIMEOUT";
+    default:     return "UM3683 Table 17 참고";
+  }
+}
+
+static void printLddFlags(const uint8_t ldd[5]) {
+  bool any = false;
+  for (int reg = 0; reg < 5; reg++) {
+    for (int bit = 0; bit < 8; bit++) {
+      if (!(ldd[reg] & (1u << bit))) continue;
+      const char *name = kLddFlags[reg][bit];
+      Serial.printf("      LDD_ERROR_STATUS_%d bit%d: %s\n", reg + 1, bit, name ? name : "(예약)");
+      any = true;
+    }
+  }
+  if (!any) Serial.println(F("      레이저 드라이버 에러 플래그 없음"));
+}
+
+// UM3683 2.4: 레이저 안전 에러 후 LDD 는 safe mode 에 들어간다. start() 만 다시
+// 하면 LDD_TIMEOUT(0x0008) 이 난다. XSHUT 부터 전부 다시 올려야 한다.
+static Err rebootAndStart() {
+  Err e = g_dev.powerOn();
+  if (e == Err::Ok) e = g_dev.loadFirmware();
+  if (e == Err::Ok) e = g_dev.boot();
+  if (e == Err::Ok) e = g_dev.configure(*g_res, CFG_CONTEXT, CFG_POWER, CFG_SYNC,
+                                        CFG_EXPOSURE_MS, CFG_PERIOD_US);
+  if (e == Err::Ok) e = g_dev.start();
+  return e;
 }
 
 static void printFrame(const FrameView &f, uint32_t n) {
@@ -176,10 +233,9 @@ void loop() {
 
   Serial.printf("프레임 실패: %s\n", errName(e));
   dumpStatus("실패");
-  // FW 폴트로 STANDBY 에 떨어졌으면 몇 번 다시 시작해 재현되는지 본다.
-  Status st;
-  if (++fails <= 3 && g_dev.readStatus(&st) == Err::Ok && st.fsm == FSM_STANDBY) {
-    Serial.printf("  재시작 시도 %lu/3: %s\n", (unsigned long)fails, errName(g_dev.start()));
+  // 폴트 후에는 XSHUT 부터 전부 다시 올려 재현되는지 본다 (UM3683 2.4).
+  if (++fails <= 3) {
+    Serial.printf("  재부팅 후 재시작 %lu/3: %s\n", (unsigned long)fails, errName(rebootAndStart()));
   }
   delay(1500);
 }
