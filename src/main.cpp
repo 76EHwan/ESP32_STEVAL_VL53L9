@@ -173,6 +173,17 @@ void setup() {
   }
   if (PIN_INTR >= 0) pinMode(PIN_INTR, INPUT_PULLUP);
 
+  // Wire 전에 선 상태를 본다. SDA/SCL 풀업(R7/R8)은 STEVAL 쪽 HOST_IOVDD 에서 온다.
+  // 둘 다 0 이면 STEVAL 전원이 없거나 GND 가 ESP32 와 공통이 아니다.
+  pinMode(PIN_SDA, INPUT);
+  pinMode(PIN_SCL, INPUT);
+  delay(5);
+  Serial.printf("  선 상태 (내부 풀업 끔): SDA=%d SCL=%d  %s\n", digitalRead(PIN_SDA),
+                digitalRead(PIN_SCL),
+                (digitalRead(PIN_SDA) && digitalRead(PIN_SCL))
+                    ? "정상 (외부 풀업 있음)"
+                    : "!! LOW: STEVAL 전원 / 공통 GND / J3 확인");
+
   // 버퍼를 먼저 키운다. 실패하면 64B 청크 쓰기와 240B 읽기가 조용히 잘린다.
   if (Wire.setBufferSize(kWireBuffer) != kWireBuffer) {
     Serial.println(F("  !! Wire.setBufferSize 실패. 중단."));
