@@ -138,6 +138,7 @@ static Err rebootAndStart() {
   return e;
 }
 
+#if SWEEP_MODE
 struct SweepCase {
   const char *res;
   Context ctx;
@@ -206,6 +207,7 @@ static void runSweep() {
   }
   Serial.printf("\n결과: %d / %d 조합에서 프레임 수신\n", ok_count, n);
 }
+#endif
 
 static void printFrame(const FrameView &f, uint32_t n) {
   uint32_t valid = 0, amp_sum = 0;
