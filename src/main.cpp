@@ -21,6 +21,9 @@ using namespace vl53l9cx;
 #define CFG_EXPOSURE_MS  10
 #define CFG_PERIOD_US    100000UL         // AUTONOMOUS 에서만 의미가 있다
 
+// 1 = 설정 조합을 단순한 것부터 차례로 시험한다. 조합마다 XSHUT 부터 재부팅한다.
+#define SWEEP_MODE       0
+
 // 이만큼의 프레임마다 깊이 맵을 문자로 찍는다 (0 = 안 찍음)
 #define ASCII_MAP_EVERY  5
 
@@ -135,6 +138,75 @@ static Err rebootAndStart() {
   return e;
 }
 
+struct SweepCase {
+  const char *res;
+  Context ctx;
+  Power power;
+  Sync sync;
+  uint16_t exposure_ms;
+};
+
+// 가장 단순한 것(4x4, 짧은 노출)부터 기본 설정까지
+static const SweepCase kSweep[] = {
+    {"24x20", CONTEXT_SHORT, POWER_REGULAR,   SYNC_MANUAL,     1},
+    {"54x42", CONTEXT_SHORT, POWER_REGULAR,   SYNC_MANUAL,     1},
+    {"54x42", CONTEXT_SHORT, POWER_ULTRA_LOW, SYNC_MANUAL,     10},
+    {"4x4",   CONTEXT_SHORT, POWER_REGULAR,   SYNC_MANUAL,     1},
+    {"4x4",   CONTEXT_SHORT, POWER_ULTRA_LOW, SYNC_MANUAL,     1},
+    {"4x4",   CONTEXT_LONG,  POWER_REGULAR,   SYNC_MANUAL,     1},
+    {"4x4",   CONTEXT_SHORT, POWER_REGULAR,   SYNC_AUTONOMOUS, 1},
+    {"4x4",   CONTEXT_SHORT, POWER_REGULAR,   SYNC_MANUAL,     10},
+    {"8x6",   CONTEXT_SHORT, POWER_REGULAR,   SYNC_MANUAL,     1},
+    {"12x10", CONTEXT_SHORT, POWER_REGULAR,   SYNC_MANUAL,     1},
+    {"18x14", CONTEXT_SHORT, POWER_REGULAR,   SYNC_MANUAL,     1},
+};
+
+static void runSweep() {
+  banner("설정 조합 시험 (조합마다 전체 재부팅)");
+  int ok_count = 0;
+  const int n = sizeof(kSweep) / sizeof(kSweep[0]);
+  for (int i = 0; i < n; i++) {
+    const SweepCase &c = kSweep[i];
+    const Resolution *res = findResolution(c.res);
+    Serial.printf("[%2d/%d] %-5s %-5s %-9s %-10s exp=%2u ms : ", i + 1, n, c.res,
+                  c.ctx == CONTEXT_SHORT ? "SHORT" : "LONG",
+                  c.power == POWER_ULTRA_LOW ? "ULTRA_LOW" : "REGULAR",
+                  c.sync == SYNC_MANUAL ? "MANUAL" : "AUTONOMOUS", c.exposure_ms);
+    // 단계 표시: p=powerOn l=load b=boot c=configure s=start t=trigger w=wait r=read
+    Serial.print('p'); Serial.flush();
+    Err e = g_dev.powerOn();
+    if (e == Err::Ok) { Serial.print('l'); Serial.flush(); e = g_dev.loadFirmware(); }
+    if (e == Err::Ok) { Serial.print('b'); Serial.flush(); e = g_dev.boot(); }
+    if (e == Err::Ok) { Serial.print('c'); Serial.flush(); e = g_dev.configure(*res, c.ctx, c.power, c.sync, c.exposure_ms, 100000UL); }
+    if (e == Err::Ok) { Serial.print('s'); Serial.flush(); e = g_dev.start(); }
+    if (e != Err::Ok) { Serial.printf(" 시작 실패 (%s)\n", errName(e)); continue; }
+    if (c.sync == SYNC_MANUAL) { Serial.print('t'); Serial.flush(); e = g_dev.triggerFrame(); }
+    if (e == Err::Ok) { Serial.print('w'); Serial.flush(); e = g_dev.waitFrame(500); }
+    if (e == Err::Ok) { Serial.print('r'); Serial.flush(); e = g_dev.readFrame(g_frame, res->frameBytes()); }
+    Serial.print(' ');
+    if (e == Err::Ok) {
+      const FrameView f(g_frame, *res);
+      uint32_t valid = 0;
+      for (int r = 0; r < res->rows; r++)
+        for (int k = 0; k < res->cols; k++) valid += f.valid(r, k);
+      Serial.printf("** 프레임 수신 ** fc=%lu 유효 %lu/%u 중앙 %u mm\n",
+                    (unsigned long)f.frameCounter(), (unsigned long)valid,
+                    res->rows * res->cols, f.depthMm(res->rows / 2, res->cols / 2));
+      ok_count++;
+      continue;
+    }
+    Status st;
+    if (g_dev.readStatus(&st) == Err::Ok) {
+      Serial.printf("실패 fsm=%s code=0x%04X status=0x%02X ldd=%02X %02X %02X %02X %02X\n",
+                    fsmName(st.fsm), st.error_code, st.error_status, st.ldd_status[0],
+                    st.ldd_status[1], st.ldd_status[2], st.ldd_status[3], st.ldd_status[4]);
+    } else {
+      Serial.printf("실패 (%s), 상태 읽기도 실패\n", errName(e));
+    }
+  }
+  Serial.printf("\n결과: %d / %d 조합에서 프레임 수신\n", ok_count, n);
+}
+
 static void printFrame(const FrameView &f, uint32_t n) {
   uint32_t valid = 0, amp_sum = 0;
   uint16_t dmin = 0xFFFF, dmax = 0;
@@ -211,6 +283,11 @@ void setup() {
     Serial.println(F("  !! 해상도 설정 오류. 중단."));
     return;
   }
+
+#if SWEEP_MODE
+  runSweep();
+  return;
+#endif
 
   banner("부팅");
   if (!step(g_dev.powerOn(), "powerOn (XSHUT, ROM 부팅)")) return;
