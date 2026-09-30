@@ -66,6 +66,17 @@ static void dumpStatus(const char *when) {
                 st.ldd_status[4], (unsigned long)st.frame_counter, st.temperature,
                 st.ldd_temperature);
   printLddFlags(st.ldd_status);
+  Serial.print(F("    ldd_power ch0 step1..7 ="));
+  for (int i = 0; i < 7; i++) Serial.printf(" %u", st.ldd_power_ch0[i]);
+  Serial.print(F("\n    ldd_power ch1 step1..7 ="));
+  for (int i = 0; i < 7; i++) Serial.printf(" %u", st.ldd_power_ch1[i]);
+  Serial.println();
+  Serial.print(F("    status line 0x0028.."));
+  for (size_t i = 0; i < kStatusLineBytes; i++) {
+    if (i % 20 == 0) Serial.printf("\n      +%02u:", (unsigned)i);
+    Serial.printf(" %02X", st.raw[i]);
+  }
+  Serial.println();
   Serial.printf("    ref LONG  amp %u/%u dist %u/%u | ref SHORT amp %u/%u dist %u/%u\n",
                 st.ref_long_amp[0], st.ref_long_amp[1], st.ref_long_dist[0], st.ref_long_dist[1],
                 st.ref_short_amp[0], st.ref_short_amp[1], st.ref_short_dist[0],

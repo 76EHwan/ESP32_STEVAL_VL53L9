@@ -65,11 +65,14 @@ struct Status {
   uint32_t frame_counter;
   uint16_t temperature;
   uint16_t ldd_temperature;
+  uint16_t ldd_power_ch0[7];           // 0x0030 + 2n: 스텝별 레이저 드라이버 출력 (UM3683 Table 7)
+  uint16_t ldd_power_ch1[7];           // 0x003E + 2n
   uint16_t ref_long_amp[2],  ref_long_dist[2];
   uint16_t ref_short_amp[2], ref_short_dist[2];
   uint16_t error_code;
   uint8_t  error_status;               // bit7 FW, bit6 REF_ARRAY, bit5 PLL, bit4 SOF, bit3 I_LIMIT ...
   uint8_t  ldd_status[5];
+  uint8_t  raw[kStatusLineBytes];      // 0x0028 부터 읽은 원본
 };
 
 // readFrame() 이 채운 원시 버퍼를 장면 방향(렌즈 반전 해제, 크롭 적용)으로 본다.

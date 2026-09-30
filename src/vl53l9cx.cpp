@@ -246,6 +246,11 @@ Err Device::readStatus(Status *st) {
   st->frame_counter   = le32(s + 0);
   st->temperature     = le16(s + 4);
   st->ldd_temperature = le16(s + 6);
+  for (int i = 0; i < 7; i++) {
+    st->ldd_power_ch0[i] = le16(s + 8 + i * 2);    // 0x0030
+    st->ldd_power_ch1[i] = le16(s + 22 + i * 2);   // 0x003E
+  }
+  memcpy(st->raw, s, sizeof(s));
   for (int i = 0; i < 2; i++) {
     st->ref_long_amp[i]   = le16(s + 36 + i * 4);
     st->ref_long_dist[i]  = le16(s + 38 + i * 4);
