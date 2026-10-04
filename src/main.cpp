@@ -197,13 +197,25 @@ static void dumpAllRegs(const char *when) {
 
 // UM3683 2.4: 레이저 안전 에러 후 LDD 는 safe mode 에 들어간다. start() 만 다시
 // 하면 LDD_TIMEOUT(0x0008) 이 난다. XSHUT 부터 전부 다시 올려야 한다.
+// 오실로스코프 마커. 구간 정의는 board_config.h 의 PIN_SCOPE_TRIG 참고.
+static void scopeMark(bool on) {
+  if (PIN_SCOPE_TRIG >= 0) digitalWrite(PIN_SCOPE_TRIG, on ? HIGH : LOW);
+}
+
+static Err startMarked() {
+  scopeMark(true);
+  const Err e = g_dev.start();
+  scopeMark(false);
+  return e;
+}
+
 static Err rebootAndStart() {
   Err e = g_dev.powerOn();
   if (e == Err::Ok) e = g_dev.loadFirmware();
   if (e == Err::Ok) e = g_dev.boot();
   if (e == Err::Ok) e = g_dev.configure(*g_res, CFG_CONTEXT, CFG_POWER, CFG_SYNC,
                                         CFG_EXPOSURE_MS, CFG_PERIOD_US);
-  if (e == Err::Ok) e = g_dev.start();
+  if (e == Err::Ok) e = startMarked();
   return e;
 }
 
@@ -326,6 +338,10 @@ void setup() {
     digitalWrite(PIN_SYNC_IN, HIGH);
   }
   if (PIN_INTR >= 0) pinMode(PIN_INTR, INPUT_PULLUP);
+  if (PIN_SCOPE_TRIG >= 0) {
+    pinMode(PIN_SCOPE_TRIG, OUTPUT);
+    digitalWrite(PIN_SCOPE_TRIG, LOW);
+  }
 
   // Wire 전에 선 상태를 본다. SDA/SCL 풀업(R7/R8)은 STEVAL 쪽 HOST_IOVDD 에서 온다.
   // 둘 다 0 이면 STEVAL 전원이 없거나 GND 가 ESP32 와 공통이 아니다.
@@ -379,7 +395,7 @@ void setup() {
                             CFG_PERIOD_US), "configure")) return;
   Serial.printf("    프레임 %u B\n", (unsigned)g_res->frameBytes());
 
-  if (!step(g_dev.start(), "start")) { dumpStatus("start 실패"); return; }
+  if (!step(startMarked(), "start")) { dumpStatus("start 실패"); return; }
   dumpStatus("start 직후");
   if (DUMP_ALL_REGS) dumpAllRegs("start 직후 STREAMING");
 
@@ -393,8 +409,10 @@ void loop() {
   if (!g_ready) { delay(1000); return; }
 
   Err e = Err::Ok;
+  scopeMark(true);
   if (CFG_SYNC == SYNC_MANUAL) e = g_dev.triggerFrame();
   if (e == Err::Ok) e = g_dev.waitFrame(1000);
+  scopeMark(false);
   if (e == Err::Ok) e = g_dev.readFrame(g_frame, g_res->frameBytes());
 
   if (e == Err::Ok) {
@@ -403,12 +421,23 @@ void loop() {
     return;
   }
 
-  Serial.printf("프레임 실패: %s\n", errName(e));
-  dumpStatus("실패");
-  if (DUMP_ALL_REGS && fails == 0) dumpAllRegs("첫 폴트 직후");
-  // 폴트 후에는 XSHUT 부터 전부 다시 올려 재현되는지 본다 (UM3683 2.4).
-  if (++fails <= 3) {
-    Serial.printf("  재부팅 후 재시작 %lu/3: %s\n", (unsigned long)fails, errName(rebootAndStart()));
+  ++fails;
+  if (fails <= 3) {
+    Serial.printf("프레임 실패 #%lu: %s\n", (unsigned long)fails, errName(e));
+    dumpStatus("실패");
+    if (DUMP_ALL_REGS && fails == 1) dumpAllRegs("첫 폴트 직후");
+  } else {
+    // 같은 폴트를 반복하므로 한 줄만 찍는다
+    Status st;
+    if (g_dev.readStatus(&st) == Err::Ok) {
+      Serial.printf("프레임 실패 #%lu: code=0x%04X status=0x%02X ldd=%02X %02X %02X %02X %02X\n",
+                    (unsigned long)fails, st.error_code, st.error_status, st.ldd_status[0],
+                    st.ldd_status[1], st.ldd_status[2], st.ldd_status[3], st.ldd_status[4]);
+    }
   }
+  // 폴트 후 LDD 는 safe mode 라 STANDBY 에서 트리거하면 CMD_ERROR_FORBIDDEN 이 난다.
+  // 매번 XSHUT 부터 재부팅해 다음 트리거도 정상 조건에서 일어나게 한다 (UM3683 2.4).
+  const Err re = rebootAndStart();
+  if (re != Err::Ok) Serial.printf("  재부팅 실패: %s\n", errName(re));
   delay(1500);
 }
